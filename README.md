@@ -1,4 +1,4 @@
-# Geo Diffusion
+# Mini-Diffusion-Transformer
 
 A mini transformer-based diffusion model for generating geometric shapes from text prompts.
 
