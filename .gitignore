@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.env/
+
+# Generated datasets
+dataset/
+test_dataset/
+data/geometric_shapes/
+
+# Output directories
+output/
+visualization_output/
+runs/
+checkpoints/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+
+# Model checkpoints and weights
+*.pt
+*.pth
+*.h5
+*.ckpt
+*.pb
+
+# Specific to this project
+# Add any other project-specific files or directories to ignore
