@@ -3,19 +3,65 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.nn.parallel import DataParallel
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import gc
 
 from model import DiffusionModel
 from data import GeometricShapesDataset, create_dataloader
 from utils import TextTokenizer, plot_generated_shapes, plot_diffusion_steps
 
 
+def print_gpu_memory_usage():
+    """Print GPU memory usage for all available GPUs."""
+    for i in range(torch.cuda.device_count()):
+        total_memory = torch.cuda.get_device_properties(i).total_memory / 1024 / 1024 / 1024  # GB
+        reserved_memory = torch.cuda.memory_reserved(i) / 1024 / 1024 / 1024  # GB
+        allocated_memory = torch.cuda.memory_allocated(i) / 1024 / 1024 / 1024  # GB
+        free_memory = total_memory - reserved_memory
+        print(f"GPU {i}: Total: {total_memory:.1f} GB | Reserved: {reserved_memory:.1f} GB | Allocated: {allocated_memory:.1f} GB | Free: {free_memory:.1f} GB")
+
 def train(args):
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Set memory management options for PyTorch
+    if args.memory_efficient:
+        # Enable memory-efficient features
+        torch.cuda.empty_cache()
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    
+    # Check available GPUs
+    num_gpus = torch.cuda.device_count()
+    print(f"Number of available GPUs: {num_gpus}")
+    
+    # List GPU information
+    for i in range(num_gpus):
+        gpu_name = torch.cuda.get_device_name(i)
+        gpu_mem = torch.cuda.get_device_properties(i).total_memory / 1024 / 1024 / 1024  # Convert to GB
+        print(f"GPU {i}: {gpu_name} with {gpu_mem:.1f} GB memory")
+    
+    # Set primary device
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"Using primary device: {device}")
+    
+    # Exclude RTX 3070 if present (has less memory than 3090s)
+    device_ids = None
+    if num_gpus > 2:
+        # Check if we have a mix of 3090 and 3070
+        gpu_names = [torch.cuda.get_device_name(i) for i in range(num_gpus)]
+        if any('3070' in name for name in gpu_names):
+            # Only use the 3090s
+            device_ids = [i for i, name in enumerate(gpu_names) if '3090' in name]
+            print(f"Using only RTX 3090 GPUs: {device_ids}")
+    
+    # Training phases configuration
+    phases = [
+        {"epochs": 15, "target_noise_offset": 1, "description": "Phase 1: 1-step denoising"},
+        {"epochs": 10, "target_noise_offset": 2, "description": "Phase 2: 2-step denoising"},
+        {"epochs": args.num_epochs - 25, "target_noise_offset": 0, "description": "Phase 3: Full denoising"}
+    ]
+    
+    current_epoch = 0
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -51,6 +97,15 @@ def train(args):
         num_noise_levels=args.num_noise_levels
     ).to(device)
     
+    # Wrap model with DataParallel if multiple GPUs are available
+    if num_gpus > 1:
+        if device_ids:
+            print(f"Using DataParallel across GPUs: {device_ids}")
+            model = DataParallel(model, device_ids=device_ids)
+        else:
+            print(f"Using DataParallel across {num_gpus} GPUs")
+            model = DataParallel(model)
+    
     # Initialize optimizer
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
     
@@ -64,97 +119,166 @@ def train(args):
     train_losses = []
     val_losses = []
     
-    for epoch in range(args.num_epochs):
-        # Training
-        model.train()
-        train_loss = 0.0
-        train_pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{args.num_epochs} [Train]")
+    # Training loop
+    for phase in phases:
+        print(f"\nStarting {phase['description']}")
+        print(f"Training for {phase['epochs']} epochs with target_noise_offset={phase['target_noise_offset']}")
         
-        for batch in train_pbar:
-            # Get batch data
-            token_ids = batch["token_ids"].to(device)
-            images = batch["image"].to(device)
+        for epoch_in_phase in range(phase['epochs']):
+            current_epoch += 1
             
-            # Forward pass
+            # Training
+            model.train()
+            train_loss = 0.0
+            train_pbar = tqdm(train_dataloader, desc=f"Epoch {current_epoch}/{args.num_epochs} [Train]")
+        
+            # Implement gradient accumulation
+            accumulation_steps = args.gradient_accumulation_steps
             optimizer.zero_grad()
             
-            # Generate seeds from image hashes for consistent noise patterns
-            # Use a simple hash function based on the sum of pixel values
-            image_seeds = [(img.sum() * 1000).int().item() for img in images]
-            
-            decoded_images, noise_pred, noise_target, applied_noise = model(token_ids, images, seed=image_seeds)
-            
-            # Compute loss
-            loss = model.compute_loss(decoded_images, images, noise_pred, noise_target, applied_noise)
-            
-            # Backward pass
-            loss.backward()
-            optimizer.step()
-            
-            # Update progress bar
-            train_loss += loss.item()
-            train_pbar.set_postfix({"loss": loss.item()})
-        
-        # Calculate average training loss
-        train_loss /= len(train_dataloader)
-        train_losses.append(train_loss)
-        
-        # Validation
-        model.eval()
-        val_loss = 0.0
-        val_pbar = tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{args.num_epochs} [Val]")
-        
-        with torch.no_grad():
-            for batch in val_pbar:
+            for batch_idx, batch in enumerate(train_pbar):
                 # Get batch data
                 token_ids = batch["token_ids"].to(device)
                 images = batch["image"].to(device)
                 
-                # Forward pass
-                
                 # Generate seeds from image hashes for consistent noise patterns
+                # Use a simple hash function based on the sum of pixel values
                 image_seeds = [(img.sum() * 1000).int().item() for img in images]
                 
-                decoded_images, noise_pred, noise_target, applied_noise = model(token_ids, images, seed=image_seeds)
+                # Forward pass
+                decoded_images, noise_pred, noise_target, applied_noise, target_images = model(
+                    token_ids, 
+                    images, 
+                    seed=image_seeds,
+                    target_noise_offset=phase['target_noise_offset']
+                )
                 
-                # Compute loss
-                loss = model.compute_loss(decoded_images, images, noise_pred, noise_target, applied_noise)
+                # Compute loss - handle both DataParallel and non-DataParallel cases
+                if isinstance(model, DataParallel):
+                    loss = model.module.compute_loss(
+                        decoded_images, 
+                        target_images, 
+                        noise_pred, 
+                        noise_target, 
+                        applied_noise,
+                        target_noise_offset=phase['target_noise_offset']
+                    )
+                else:
+                    loss = model.compute_loss(
+                        decoded_images, 
+                        target_images, 
+                        noise_pred, 
+                        noise_target, 
+                        applied_noise,
+                        target_noise_offset=phase['target_noise_offset']
+                    )
+                
+                # Scale the loss to account for gradient accumulation
+                loss = loss / accumulation_steps
+                
+                # Backward pass
+                loss.backward()
+                
+                # Update weights only after accumulation_steps
+                if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_dataloader):
+                    optimizer.step()
+                    optimizer.zero_grad()
+                
+                # Free up memory
+                del decoded_images, noise_pred, noise_target, applied_noise, target_images
+                if args.memory_efficient and (batch_idx + 1) % 5 == 0:
+                    torch.cuda.empty_cache()
                 
                 # Update progress bar
-                val_loss += loss.item()
-                val_pbar.set_postfix({"loss": loss.item()})
+                train_loss += loss.item() * accumulation_steps  # Scale back for reporting
+                train_pbar.set_postfix({"loss": loss.item() * accumulation_steps})
+                
+                # Print memory usage periodically
+                if args.memory_efficient and (batch_idx + 1) % 10 == 0:
+                    print_gpu_memory_usage()
+            
+            # Calculate average training loss
+            train_loss /= len(train_dataloader)
+            train_losses.append(train_loss)
+            
+            # Validation
+            model.eval()
+            val_loss = 0.0
+            val_pbar = tqdm(val_dataloader, desc=f"Epoch {current_epoch}/{args.num_epochs} [Val]")
         
-        # Calculate average validation loss
-        val_loss /= len(val_dataloader)
-        val_losses.append(val_loss)
-        
-        # Update learning rate scheduler
-        scheduler.step(val_loss)
-        
-        # Print epoch summary
-        print(f"Epoch {epoch+1}/{args.num_epochs} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-        
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
-            print(f"Saved best model with validation loss: {best_val_loss:.4f}")
-        
-        # Save checkpoint
-        if (epoch + 1) % args.save_every == 0:
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "train_losses": train_losses,
-                "val_losses": val_losses
-            }, os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pt"))
-        
-        # Generate samples
-        if (epoch + 1) % args.sample_every == 0:
-            generate_samples(model, tokenizer, device, args, epoch + 1)
+            with torch.no_grad():
+                for batch in val_pbar:
+                    # Get batch data
+                    token_ids = batch["token_ids"].to(device)
+                    images = batch["image"].to(device)
+                    
+                    # Forward pass
+                    
+                    # Generate seeds from image hashes for consistent noise patterns
+                    image_seeds = [(img.sum() * 1000).int().item() for img in images]
+                    
+                    decoded_images, noise_pred, noise_target, applied_noise, target_images = model(
+                        token_ids, 
+                        images, 
+                        seed=image_seeds,
+                        target_noise_offset=phase['target_noise_offset']
+                    )
+                    
+                    # Compute loss - handle both DataParallel and non-DataParallel cases
+                    if isinstance(model, DataParallel):
+                        loss = model.module.compute_loss(
+                            decoded_images, 
+                            target_images, 
+                            noise_pred, 
+                            noise_target, 
+                            applied_noise,
+                            target_noise_offset=phase['target_noise_offset']
+                        )
+                    else:
+                        loss = model.compute_loss(
+                            decoded_images, 
+                            target_images, 
+                            noise_pred, 
+                            noise_target, 
+                            applied_noise,
+                            target_noise_offset=phase['target_noise_offset']
+                        )
+                    
+                    # Update progress bar
+                    val_loss += loss.item()
+                    val_pbar.set_postfix({"loss": loss.item()})
+            
+            # Calculate average validation loss
+            val_loss /= len(val_dataloader)
+            val_losses.append(val_loss)
+            
+            # Update learning rate scheduler
+            scheduler.step(val_loss)
+            
+            # Print epoch summary
+            print(f"Epoch {current_epoch}/{args.num_epochs} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            
+            # Save best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
+                print(f"Saved best model with validation loss: {best_val_loss:.4f}")
+            
+            # Save checkpoint
+            if current_epoch % args.save_every == 0:
+                torch.save({
+                    "epoch": current_epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "train_losses": train_losses,
+                    "val_losses": val_losses
+                }, os.path.join(args.output_dir, f"checkpoint_epoch_{current_epoch}.pt"))
+            
+            # Generate samples
+            if current_epoch % args.sample_every == 0:
+                generate_samples(model, tokenizer, device, args, current_epoch)
     
     # Plot training and validation losses
     plt.figure(figsize=(10, 5))
@@ -193,12 +317,21 @@ def generate_samples(model, tokenizer, device, args, epoch):
     with torch.no_grad():
         # Use a fixed seed for sample generation to ensure consistency across epochs
         sample_seed = 42  # Fixed seed for sample generation
-        generated_images = model.generate(
-            token_ids,
-            num_steps=args.generation_steps,
-            temperature=args.temperature,
-            seed=sample_seed
-        )
+        # Handle both DataParallel and non-DataParallel cases
+        if isinstance(model, DataParallel):
+            generated_images = model.module.generate(
+                token_ids,
+                num_steps=args.generation_steps,
+                temperature=args.temperature,
+                seed=sample_seed
+            )
+        else:
+            generated_images = model.generate(
+                token_ids,
+                num_steps=args.generation_steps,
+                temperature=args.temperature,
+                seed=sample_seed
+            )
     
     # Plot and save generated images
     fig = plot_generated_shapes(generated_images, prompts)
@@ -233,12 +366,21 @@ def generate_samples(model, tokenizer, device, args, epoch):
                     noise_level = 1.0 - step / (args.generation_steps - 1)
                     
                     # Add noise to current image with consistent noise pattern
-                    noisy_image, _ = model.add_noise(image, noise_level, noise=initial_noise)
-                    
-                    # Process through model
-                    text_features, image_features = model.input_module(token_ids[0:1], noisy_image)
-                    combined_features = model.transformer_module(text_features, image_features)
-                    decoded_image, _ = model.output_module(combined_features)
+                    # Handle both DataParallel and non-DataParallel cases
+                    if isinstance(model, DataParallel):
+                        noisy_image, _ = model.module.add_noise(image, noise_level, noise=initial_noise)
+                        
+                        # Process through model
+                        text_features, image_features = model.module.input_module(token_ids[0:1], noisy_image)
+                        combined_features = model.module.transformer_module(text_features, image_features)
+                        decoded_image, _ = model.module.output_module(combined_features)
+                    else:
+                        noisy_image, _ = model.add_noise(image, noise_level, noise=initial_noise)
+                        
+                        # Process through model
+                        text_features, image_features = model.input_module(token_ids[0:1], noisy_image)
+                        combined_features = model.transformer_module(text_features, image_features)
+                        decoded_image, _ = model.output_module(combined_features)
                     
                     # Update image
                     image = decoded_image
@@ -293,6 +435,12 @@ if __name__ == "__main__":
                         help="Save checkpoint every N epochs")
     parser.add_argument("--sample_every", type=int, default=5,
                         help="Generate samples every N epochs")
+    
+    # Memory management parameters
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Number of steps to accumulate gradients before updating weights")
+    parser.add_argument("--memory_efficient", action="store_true",
+                        help="Enable memory-efficient training options")
     
     # Generation parameters
     parser.add_argument("--generation_steps", type=int, default=50,

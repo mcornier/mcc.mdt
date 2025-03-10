@@ -108,7 +108,7 @@ class DiffusionModel(nn.Module):
         
         return noisy_images, noise
     
-    def forward(self, token_ids, images, noise_level=None, seed=None):
+    def forward(self, token_ids, images, noise_level=None, seed=None, target_noise_offset=1):
         """
         Forward pass for training.
         
@@ -117,32 +117,46 @@ class DiffusionModel(nn.Module):
             images: Tensor of shape [batch_size, 1, 32, 32]
             noise_level: Optional float between 0 and 1.
                          If None, a random noise level is sampled.
-            seed: Optional seed for noise generation. Can be either:
-                 - A single integer: same seed used for all images
-                 - A list/tensor of integers: one seed per image in the batch
+            seed: Optional seed for noise generation
+            target_noise_offset: Number of noise levels to reduce for target (default: 1)
+                               0 means target is original image
         
         Returns:
             decoded_images: Tensor of shape [batch_size, 1, 32, 32]
             noise_pred: Tensor of shape [batch_size, num_noise_levels]
             noise_target: Tensor of shape [batch_size, num_noise_levels]
             applied_noise: The noise that was applied to the images
+            target_images: The target images to aim for
         """
         batch_size = images.shape[0]
+        device = images.device
         
         # Sample noise level if not provided
         if noise_level is None:
-            noise_level_idx = torch.randint(0, self.num_noise_levels, (1,)).item()
+            # Don't sample the lowest levels as they won't have a target
+            max_idx = self.num_noise_levels - target_noise_offset
+            if max_idx < 1:
+                max_idx = 1
+            noise_level_idx = torch.randint(0, max_idx, (1,)).item()
             noise_level = self.noise_schedule[noise_level_idx]
         else:
             # Find closest noise level
             noise_level_idx = torch.abs(self.noise_schedule - noise_level).argmin().item()
         
         # Create target for noise prediction
-        noise_target = torch.zeros(batch_size, self.num_noise_levels, device=images.device)
+        noise_target = torch.zeros(batch_size, self.num_noise_levels, device=device)
         noise_target[:, noise_level_idx] = 1.0
         
-        # Add noise to images
+        # Add noise to images for input
         noisy_images, applied_noise = self.add_noise(images, noise_level, seed=seed)
+        
+        # Create target images based on target_noise_offset
+        if target_noise_offset == 0:
+            target_images = images  # Original images
+        else:
+            target_noise_idx = max(0, noise_level_idx - target_noise_offset)
+            target_noise_level = self.noise_schedule[target_noise_idx]
+            target_images, _ = self.add_noise(images, target_noise_level, noise=applied_noise)
         
         # Process through input module
         text_features, image_features = self.input_module(token_ids, noisy_images)
@@ -153,7 +167,7 @@ class DiffusionModel(nn.Module):
         # Process through output module
         decoded_images, noise_pred = self.output_module(combined_features)
         
-        return decoded_images, noise_pred, noise_target, applied_noise
+        return decoded_images, noise_pred, noise_target, applied_noise, target_images
     
     def generate(self, token_ids, num_steps=50, temperature=1.0, seed=None):
         """
@@ -203,7 +217,7 @@ class DiffusionModel(nn.Module):
         
         return images
     
-    def compute_loss(self, decoded_images, target_images, noise_pred, noise_target, applied_noise=None):
+    def compute_loss(self, decoded_images, target_images, noise_pred, noise_target, applied_noise=None, target_noise_offset=1):
         """
         Compute loss for training.
         
